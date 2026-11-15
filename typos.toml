@@ -1,0 +1,18 @@
+# Copyright 2026 hrzlgnm
+# SPDX-License-Identifier: MIT
+
+[files]
+ignore-files = true
+ignore-hidden = false
+extend-exclude = [".git/"]
+
+[default]
+check-filename = true
+extend-ignore-re = ["digest to \\b[0-9a-f]{7,}\\b", "\\[[0-9a-f]{7}\\]"]
+
+[default.extend-words]
+# rattatui crate name
+ratatui = "ratatui"
+# UPnP is split by the identifier tokenizer into "U" + "Pn"
+UPnP = "UPnP"
+Pn = "Pn"

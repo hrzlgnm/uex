@@ -1,0 +1,36 @@
+# Copyright 2026 hrzlgnm
+# SPDX-License-Identifier: MIT
+
+[package]
+name = "uex"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Terminal UI to browse and debug SSDP/UPnP on the local network — live devices, advertisements, descriptions, and raw packets"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "z"
+panic = "abort"
+strip = true
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+socket2 = { version = "0.6", features = ["all"] }
+socket-pktinfo = "0.4"
+log = "0.4"
+chrono = "0.4"
+anyhow = "1"
+if-addrs = { version = "0.15", features = ["link-local"] }
+clap = { version = "4", features = ["derive"] }
+# Plain-HTTP client for LOCATION description fetches: UPnP descriptions
+# are served over http:// on the LAN, so no TLS stack is pulled in.
+ureq = { version = "3", default-features = false }
+# Read-only DOM for device description XML (UDA 2.0 §2).
+roxmltree = "0.20"
+url = "2"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.32", features = ["signal"] }
