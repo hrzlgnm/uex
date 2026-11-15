@@ -77,6 +77,48 @@ pub fn parse_max_age(cache_control: &str) -> Option<u32> {
     })
 }
 
+/// Strict standard-alphabet base64 (length a multiple of 4, `=` padding
+/// only at the end); `None` for anything else. std-only, for the few
+/// vendor headers that carry base64.
+pub fn decode_base64(s: &str) -> Option<Vec<u8>> {
+    if s.is_empty() || !s.len().is_multiple_of(4) {
+        return None;
+    }
+    let val = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        } as u32)
+    };
+    let bytes = s.as_bytes();
+    let pad = bytes.iter().rev().take_while(|&&c| c == b'=').count();
+    if pad > 2 || bytes[..bytes.len() - pad].contains(&b'=') {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks(4) {
+        let mut n = 0u32;
+        let mut real = 0;
+        for &c in chunk {
+            n <<= 6;
+            if c != b'=' {
+                n |= val(c)?;
+                real += 1;
+            }
+        }
+        if real < 2 {
+            return None;
+        }
+        let b = n.to_be_bytes();
+        out.extend_from_slice(&b[1..real]);
+    }
+    Some(out)
+}
+
 /// Drop the common UPnP Forum prefix for compact display.
 pub fn short_type(t: &str) -> &str {
     t.strip_prefix("urn:schemas-upnp-org:").unwrap_or(t)
@@ -121,9 +163,33 @@ pub struct Advert {
     pub count: u64,
     pub issues: Vec<Issue>,
     pub gone: Option<Instant>,
+    /// Headers of the latest message in wire order, vendor extensions
+    /// included (e.g. `X-Friendly-Name`, `01-NLS`).
+    pub headers: Vec<(String, String)>,
+    /// Wall-clock time of the latest message.
+    pub seen_at: SystemTime,
 }
 
 impl Advert {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// `X-Friendly-Name` (DIAL/Netflix MDX), base64-decoded when it is
+    /// valid base64 of printable UTF-8, else taken verbatim.
+    pub fn friendly_name_header(&self) -> Option<String> {
+        let raw = self.header("X-Friendly-Name")?.trim();
+        let printable = |t: &str| !t.is_empty() && !t.chars().any(char::is_control);
+        if let Some(text) = decode_base64(raw).and_then(|b| String::from_utf8(b).ok()) {
+            if printable(&text) {
+                return Some(text);
+            }
+        }
+        printable(raw).then(|| raw.to_string())
+    }
     pub fn lifetime(&self) -> Duration {
         Duration::from_secs(self.max_age.unwrap_or(DEFAULT_MAX_AGE) as u64)
     }
@@ -245,6 +311,8 @@ pub struct App {
     pub tab: Tab,
     pub scroll: u16,
     pub packet_cursor: usize,
+    /// Selected advert in the Adverts table (detail pane below it).
+    pub advert_cursor: usize,
     pub status: Option<(String, Instant)>,
     pub running: bool,
     pub start: Instant,
@@ -329,6 +397,7 @@ impl App {
             tab: Tab::Adverts,
             scroll: 0,
             packet_cursor: 0,
+            advert_cursor: 0,
             status: None,
             running: true,
             start: Instant::now(),
@@ -664,6 +733,9 @@ impl App {
                 Some(a) => {
                     a.gone = Some(now);
                     a.count += 1;
+                    a.headers = m.headers.clone();
+                    a.seen_at = p.at;
+                    a.src = p.src;
                 }
                 None => {
                     issues.push(Issue::info("byebye for an advert never seen alive"));
@@ -685,6 +757,8 @@ impl App {
                             count: 1,
                             issues,
                             gone: Some(now),
+                            headers: m.headers.clone(),
+                            seen_at: p.at,
                         },
                     );
                 }
@@ -742,6 +816,8 @@ impl App {
                 a.src = p.src;
                 a.iface = p.iface.clone();
                 a.via = via;
+                a.headers = m.headers.clone();
+                a.seen_at = p.at;
                 a.count += 1;
                 a.gone = None;
                 a.issues = issues;
@@ -765,6 +841,8 @@ impl App {
                         count: 1,
                         issues,
                         gone: None,
+                        headers: m.headers.clone(),
+                        seen_at: p.at,
                     },
                 );
             }
@@ -859,9 +937,9 @@ impl App {
                 return d.friendly_name.clone();
             }
         }
-        self.devices
-            .get(uuid)
-            .and_then(|d| d.adverts.values().find_map(|a| a.server.clone()))
+        let dev = self.devices.get(uuid);
+        dev.and_then(|d| d.adverts.values().find_map(Advert::friendly_name_header))
+            .or_else(|| dev.and_then(|d| d.adverts.values().find_map(|a| a.server.clone())))
             .unwrap_or_else(|| format!("uuid:{uuid}"))
     }
 
@@ -1002,6 +1080,7 @@ impl App {
             self.selected = key;
             self.scroll = 0;
             self.packet_cursor = 0;
+            self.advert_cursor = 0;
         }
     }
 
@@ -1009,6 +1088,10 @@ impl App {
         if self.tab == Tab::Packets {
             let max = self.visible_packets().len().saturating_sub(1) as isize;
             self.packet_cursor = (self.packet_cursor as isize + delta).clamp(0, max) as usize;
+        } else if let (Tab::Adverts, RowKey::Device(uuid)) = (self.tab, &self.selected) {
+            let n = self.devices.get(uuid).map_or(0, |d| d.adverts.len());
+            let max = n.saturating_sub(1) as isize;
+            self.advert_cursor = (self.advert_cursor as isize + delta).clamp(0, max) as usize;
         } else {
             self.scroll = (self.scroll as isize + delta).clamp(0, u16::MAX as isize) as u16;
         }
@@ -1178,6 +1261,26 @@ mod tests {
              LOCATION: ftp://10.0.0.2/d.xml\r\nNT: {nt}\r\nNTS: ssdp:alive\r\n\
              SERVER: Linux/5 UPnP/1.0 test/1\r\nUSN: {usn}\r\n\r\n"
         )
+    }
+
+    #[test]
+    fn base64_and_friendly_name_header() {
+        assert_eq!(decode_base64("U0hJRUxE").as_deref(), Some(&b"SHIELD"[..]));
+        assert_eq!(decode_base64("TQ==").as_deref(), Some(&b"M"[..]));
+        assert_eq!(decode_base64("TWE=").as_deref(), Some(&b"Ma"[..]));
+        assert_eq!(decode_base64("TV"), None);
+        assert_eq!(decode_base64("a=bc"), None);
+        assert_eq!(decode_base64("Living Room"), None);
+        let (mut app, _tx) = test_app();
+        let text = alive("nf", "urn:mdx-netflix-com:service:target:3", 1800).replace(
+            "\r\n\r\n",
+            "\r\nX-Friendly-Name: U0hJRUxE\r\n01-NLS: abc\r\n\r\n",
+        );
+        app.ingest(packet(&text, "10.0.0.2:36967"));
+        let a = app.devices["nf"].adverts.values().next().unwrap();
+        assert_eq!(a.header("01-nls"), Some("abc"));
+        assert_eq!(a.src.port(), 36967);
+        assert_eq!(app.display_name("nf"), "SHIELD");
     }
 
     #[test]
@@ -1353,6 +1456,25 @@ mod render_tests {
             .collect();
         assert!(screen.contains("InternetGatewayDevice"), "{screen}");
         assert!(screen.contains("http://h/ctl"));
+    }
+
+    #[test]
+    fn advert_detail_and_issues_do_not_overlap() {
+        let mut app = populated_app();
+        app.selected = RowKey::Device("root".into());
+        app.tab = Tab::Adverts;
+        let mut term = ratatui::Terminal::new(TestBackend::new(160, 50)).unwrap();
+        term.draw(|f| ui::draw(f, &app)).unwrap();
+        let screen: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("Selected advert"), "{screen}");
+        assert!(screen.contains("Headers ("));
+        assert!(screen.contains("Issues"));
     }
 
     #[test]

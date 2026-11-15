@@ -21,7 +21,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{short_type, source_label, AdvertVia, App, DescState, RowKey, Tab};
+use crate::app::{short_type, source_label, Advert, AdvertVia, App, DescState, RowKey, Tab};
 use crate::describe::{self, Device};
 use crate::issues::{worst_mark, Issue, Severity};
 
@@ -238,7 +238,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         let keys = [
             ("↑↓", "select"),
             ("Tab/1-3", "view"),
-            ("PgUp/PgDn J/K", "scroll"),
+            ("PgUp/PgDn J/K", "scroll/move"),
             ("r", "rescan"),
             ("f", "refetch"),
             ("c", "clear log"),
@@ -444,10 +444,14 @@ fn draw_adverts(frame: &mut Frame, area: Rect, app: &App, uuid: &str) {
     } else {
         issues.len().min(8) as u16 + 1
     };
+    // Table sized to its rows but capped, so the detail pane of the
+    // selected advert keeps most of the space.
+    let table_h = (dev.adverts.len() as u16 + 1).min((area.height * 2 / 5).max(4));
     let parts = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(summary.len() as u16 + 1),
+            Constraint::Length(table_h),
             Constraint::Min(3),
             Constraint::Length(issue_h),
         ])
@@ -488,7 +492,8 @@ fn draw_adverts(frame: &mut Frame, area: Rect, app: &App, uuid: &str) {
             ])
         })
         .collect();
-    let mut state = TableState::default().with_offset(app.scroll as usize);
+    let cursor = app.advert_cursor.min(dev.adverts.len().saturating_sub(1));
+    let mut state = TableState::default().with_selected(Some(cursor));
     let table = Table::new(
         rows,
         [
@@ -504,8 +509,16 @@ fn draw_adverts(frame: &mut Frame, area: Rect, app: &App, uuid: &str) {
     .header(
         Row::new(["", "NT / ST", "Via", "Expires", "Source", "Seen", "Age"])
             .style(Style::new().add_modifier(Modifier::BOLD)),
-    );
+    )
+    .row_highlight_style(Style::new().bg(Color::DarkGray));
     frame.render_stateful_widget(table, parts[1], &mut state);
+
+    if let Some((key, a)) = dev.adverts.iter().nth(cursor) {
+        frame.render_widget(
+            Paragraph::new(advert_detail_lines(key, a, now)).wrap(Wrap { trim: false }),
+            parts[2],
+        );
+    }
 
     if !issues.is_empty() {
         let mut lines = vec![Line::styled("Issues", WARN.add_modifier(Modifier::BOLD))];
@@ -515,8 +528,79 @@ fn draw_adverts(frame: &mut Frame, area: Rect, app: &App, uuid: &str) {
                 severity_style(i.severity),
             )
         }));
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), parts[2]);
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), parts[3]);
     }
+}
+
+/// Everything known about one advert, Home Assistant style: origin,
+/// timing, locations, and every header of the latest message (vendor
+/// extensions included). Header text is untrusted: control chars escaped.
+fn advert_detail_lines(key: &str, a: &Advert, now: Instant) -> Vec<Line<'static>> {
+    let p = |s: &str| describe::printable(s);
+    let row =
+        |k: &str, v: String| Line::from(vec![Span::styled(format!("{k:<14}"), DIM), Span::raw(v)]);
+    let mut lines = vec![Line::styled(
+        "Selected advert (J/K to move)",
+        Style::new().add_modifier(Modifier::BOLD),
+    )];
+    lines.push(row("USN", p(a.header("USN").unwrap_or(key))));
+    let origin = match (a.gone.is_some(), a.via) {
+        (true, _) => "NOTIFY ssdp:byebye".to_string(),
+        (false, AdvertVia::Notify) => format!("NOTIFY {}", p(a.header("NTS").unwrap_or("?"))),
+        (false, AdvertVia::Response) => "M-SEARCH reply".to_string(),
+    };
+    lines.push(row(
+        "Source",
+        format!(
+            "{origin} from {} on {}",
+            a.src,
+            if a.iface.is_empty() { "?" } else { &a.iface }
+        ),
+    ));
+    lines.push(row(
+        "Last seen",
+        format!(
+            "{} · {}× · first {} ago",
+            chrono::DateTime::<chrono::Local>::from(a.seen_at).format("%H:%M:%S"),
+            a.count,
+            fmt_secs(now - a.first_seen)
+        ),
+    ));
+    if !a.locations.is_empty() {
+        lines.push(row(
+            "Locations",
+            a.locations
+                .iter()
+                .map(|l| p(l))
+                .collect::<Vec<_>>()
+                .join("  "),
+        ));
+    }
+    if let Some(name) = a.friendly_name_header() {
+        lines.push(row(
+            "Friendly name",
+            format!("{} (X-Friendly-Name)", p(&name)),
+        ));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        format!("Headers ({})", a.headers.len()),
+        Style::new().add_modifier(Modifier::BOLD),
+    ));
+    let width = a
+        .headers
+        .iter()
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(32);
+    for (k, v) in &a.headers {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {:<width$}  ", p(k)), KEY),
+            Span::raw(p(v)),
+        ]));
+    }
+    lines
 }
 
 fn device_lines(lines: &mut Vec<Line<'static>>, d: &Device, loc: &str, base: &str) {

@@ -35,6 +35,12 @@ prints one line per discovery event to stdout:
 * **Adverts**: every USN the device announces (NT/ST), how it was learned
   (`NOTIFY`, a `200` search reply, or `byebye`), the time left of its
   `max-age`, the source address with its ingress interface, and any issues found.
+  `J`/`K` select an advert. The pane below it shows the advert in full:
+  the USN, where it came from (NOTIFY or search reply, sender `ip:port`,
+  interface), last seen, all `LOCATION`s, and every header of the latest
+  message, including vendor extensions such as `OPT`/`01-NLS` or `X-MDX-*`.
+  A base64 `X-Friendly-Name` (DIAL, Netflix MDX) is decoded and used as
+  the device name when there is no description.
 * **Description**: the parsed device description: identity, icons,
   services with resolved SCPD/control/event URLs, embedded devices.
   IPv6 link-local `LOCATION`s (`http://[fe80::…]/`) are fetched through

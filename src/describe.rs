@@ -161,7 +161,7 @@ const PREVIEW_LINE_CHARS: usize = 160;
 
 /// Printable form of untrusted text: control characters (bar tab) are
 /// escaped so a hostile body cannot drive the terminal.
-fn printable(s: &str) -> String {
+pub fn printable(s: &str) -> String {
     s.chars()
         .flat_map(|c| {
             if c.is_control() && c != '\t' {
