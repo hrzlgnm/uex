@@ -37,9 +37,10 @@ struct Args {
     #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=5))]
     mx: u8,
 
-    /// Fixed local UDP port for M-SEARCH and its unicast replies
-    /// (0 = ephemeral). Pin it to allow replies through a host firewall.
-    #[arg(long, value_name = "PORT", default_value_t = 0)]
+    /// Local UDP port for M-SEARCH and its unicast replies. Default 1900
+    /// (the SSDP port, already allowed by typical firewall rules);
+    /// 0 picks an ephemeral port.
+    #[arg(long, value_name = "PORT", default_value_t = ssdp::SSDP_PORT)]
     search_port: u16,
 
     /// Override the default log file. Appended; rotated past 5 MiB

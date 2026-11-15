@@ -19,7 +19,7 @@ cargo run --release
 uex --passive                 # listen only, never send M-SEARCH
 uex -i eth0,br0               # restrict to these interfaces
 uex -t upnp:rootdevice --mx 3 # custom search target and MX
-uex --search-port 1901        # fixed reply port (see Firewalls)
+uex --search-port 0           # search from an ephemeral port instead of 1900
 ```
 
 Without a TTY (piped or under a service manager), uex runs headless and
@@ -62,18 +62,21 @@ their own before `max-age` runs out. A cache entry expires at 100% of
 
 ## Firewalls
 
-Search replies come back as unicast to the port the search was sent from.
-Stateful firewalls (ufw, firewalld) cannot match those replies to a
-multicast request, so they drop them. uex shows a hint when searches get
-no replies. Pin the reply port and allow it, for example:
+Search replies come back as unicast to the port the search was sent
+from. Stateful firewalls (ufw, firewalld) cannot match those replies to
+a multicast request. By default uex therefore sends `M-SEARCH` from port
+1900 itself, so one firewall rule covers both announcements and replies:
 
 ```sh
-sudo ufw allow proto udp from 192.168.0.0/16 to any port 1901
-uex --search-port 1901
+sudo ufw allow proto udp from 192.168.0.0/16 to any port 1900
 ```
 
-To see IPv6 SSDP traffic under ufw, also allow `ff02::c` port 1900 in
-`/etc/ufw/before6.rules`. The stock rules only allow the IPv4 group.
+If port 1900 cannot be opened, uex falls back to an ephemeral search
+port and shows a hint when searches get no replies.
+
+To see IPv6 SSDP traffic under ufw, also allow port 1900 from
+`fe80::/10` and allow `ff02::c` in `/etc/ufw/before6.rules`. The stock
+rules only allow the IPv4 group.
 
 ## Checks
 

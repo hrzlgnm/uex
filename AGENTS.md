@@ -17,9 +17,10 @@ Headless run (no TTY) prints discovery events to stdout.
 
 * `src/main.rs` — CLI, rotating file logger, TUI init/restore.
 * `src/ssdp.rs` — transport: shared port-1900 listeners (v4 + v6 link/site
-  groups) observe NOTIFY and foreign M-SEARCH; one search socket per family
-  (`--search-port`, default ephemeral) sends M-SEARCH per interface and
-  receives unicast replies. HTTPU parse, ingress interface via IP_PKTINFO.
+  groups) observe NOTIFY and foreign M-SEARCH. By default the listener also
+  sends M-SEARCH per interface, so unicast replies hit port 1900 (one
+  firewall rule); `--search-port N` uses a separate search socket instead
+  (a second socket on 1900 would double every multicast packet). HTTPU parse, ingress interface via IP_PKTINFO.
   Interface policy mirrors mex (`lo`/`docker`/`veth` skipped unless `-i`).
 * `src/describe.rs` — LOCATION fetch (http only, 5s, 1 MiB cap, no
   redirects) and namespace-agnostic description parse.

@@ -103,6 +103,9 @@ pub struct Advert {
     /// NT for NOTIFY, ST for responses.
     pub target: String,
     pub location: Option<String>,
+    /// Every LOCATION this advert has used: multi-homed devices
+    /// alternate v4/v6 URLs, and each keeps its description cached.
+    pub locations: Vec<String>,
     pub server: Option<String>,
     pub max_age: Option<u32>,
     pub refreshed: Instant,
@@ -496,7 +499,7 @@ impl App {
         {
             out.push(
                 "no M-SEARCH replies: a host firewall may drop them; \
-                 pin --search-port and allow it"
+                 allow UDP port 1900 (or the --search-port in use)"
                     .into(),
             );
         }
@@ -598,6 +601,7 @@ impl App {
         if matches!(self.descriptions.get(location), Some(DescState::Pending)) {
             return;
         }
+        log::debug!("uex: fetch {location} (force={force})");
         self.descriptions
             .insert(location.to_string(), DescState::Pending);
         if self.fetching {
@@ -611,7 +615,9 @@ impl App {
 
     pub fn ingest(&mut self, p: Packet) {
         self.packet_total += 1;
-        if p.via == ssdp::Via::Search {
+        // By message kind, not socket: with the default search port the
+        // replies arrive on the shared port-1900 listener.
+        if matches!(&p.msg, Some(m) if m.kind == Kind::Response) {
             self.responses += 1;
         }
         let own = matches!(&p.msg, Some(m) if m.kind == Kind::Search) && self.is_own(&p);
@@ -717,6 +723,7 @@ impl App {
                         Advert {
                             target,
                             location: None,
+                            locations: Vec::new(),
                             server: None,
                             max_age: None,
                             refreshed: now,
@@ -770,9 +777,13 @@ impl App {
                     refetch = a.config_id.is_some();
                     a.config_id = config_id;
                 }
-                if location.is_some() && location != a.location {
-                    refetch = true;
-                    a.location = location;
+                // A new LOCATION is fetched once (not forced): multi-homed
+                // devices alternate v4/v6 LOCATION URLs for the same USN.
+                if let Some(l) = location {
+                    if !a.locations.contains(&l) {
+                        a.locations.push(l.clone());
+                    }
+                    a.location = Some(l);
                 }
                 if let Some(s) = m.header("SERVER") {
                     a.server = Some(s.to_string());
@@ -790,6 +801,7 @@ impl App {
                     key.clone(),
                     Advert {
                         target,
+                        locations: location.iter().cloned().collect(),
                         location,
                         server: m.header("SERVER").map(str::to_string),
                         max_age: m.header("CACHE-CONTROL").and_then(parse_max_age),
@@ -843,10 +855,15 @@ impl App {
             .devices
             .values()
             .flat_map(|d| d.adverts.values())
-            .filter_map(|a| a.location.as_deref())
+            .flat_map(|a| a.locations.iter().map(String::as_str))
             .collect();
-        self.descriptions
-            .retain(|loc, _| referenced.contains(loc.as_str()));
+        self.descriptions.retain(|loc, _| {
+            let keep = referenced.contains(loc.as_str());
+            if !keep {
+                log::debug!("uex: drop description {loc}");
+            }
+            keep
+        });
     }
 
     // ---- derived views ----------------------------------------------
@@ -858,7 +875,7 @@ impl App {
         let udn = format!("uuid:{uuid}");
         dev.adverts
             .values()
-            .filter_map(|a| a.location.as_deref())
+            .flat_map(|a| a.locations.iter().map(String::as_str))
             .find_map(|loc| match self.descriptions.get(loc) {
                 Some(DescState::Ready(f)) => {
                     f.description.root.find(&udn).map(|d| (loc, f.as_ref(), d))
@@ -875,7 +892,7 @@ impl App {
         let mut seen = HashSet::new();
         dev.adverts
             .values()
-            .filter_map(|a| a.location.as_deref())
+            .flat_map(|a| a.locations.iter().map(String::as_str))
             .filter(|l| seen.insert(*l))
             .filter_map(|l| self.descriptions.get(l).map(|s| (l, s)))
             .collect()
@@ -910,9 +927,15 @@ impl App {
             }
         }
         let udn = format!("uuid:{uuid}");
-        for (loc, st) in self.description_states(uuid) {
+        let states = self.description_states(uuid);
+        // Multi-homed devices also advertise link-local v6 URLs that
+        // cannot be fetched without a zone: only a total failure counts.
+        let any_ready = states
+            .iter()
+            .any(|(_, st)| matches!(st, DescState::Ready(_)));
+        for (loc, st) in states {
             match st {
-                DescState::Failed(e) => push(format!("description {loc}: {e}")),
+                DescState::Failed(e) if !any_ready => push(format!("description {loc}: {e}")),
                 DescState::Ready(f) if f.description.root.find(&udn).is_none() => {
                     push(format!("{udn} not found in description {loc}"))
                 }
@@ -1185,6 +1208,39 @@ mod tests {
         let later = Instant::now() + BYEBYE_LINGER + Duration::from_secs(1);
         app.evict(later);
         assert_eq!(app.devices["d1"].adverts.len(), 1);
+    }
+
+    #[test]
+    fn alternating_locations_do_not_force_refetch() {
+        let (mut app, _tx) = test_app();
+        let v4 =
+            alive("m", "uuid:m", 1800).replace("ftp://10.0.0.2/d.xml", "http://10.0.0.2/d.xml");
+        let v6 = v4.replace("http://10.0.0.2/d.xml", "http://[fe80::2]/d.xml");
+        app.ingest(packet(&v4, "10.0.0.2:1900"));
+        app.ingest(packet(&v6, "[fe80::2]:1900"));
+        app.on_fetched("http://10.0.0.2/d.xml".into(), Err("x".into()));
+        app.ingest(packet(&v4, "10.0.0.2:1900"));
+        // Settled result kept, not reset to Pending by the flip back.
+        assert!(matches!(
+            app.descriptions.get("http://10.0.0.2/d.xml"),
+            Some(DescState::Failed(_))
+        ));
+        assert_eq!(app.device_issues("m").len(), 1);
+        let xml = "<root><device><UDN>uuid:m</UDN></device></root>";
+        let ok = Fetched {
+            description: describe::parse(xml).unwrap(),
+            server: None,
+            content_type: None,
+            bytes: xml.len(),
+            elapsed: Duration::ZERO,
+        };
+        app.on_fetched("http://[fe80::2]/d.xml".into(), Ok(ok));
+        // One working LOCATION hides the other's failure.
+        assert!(
+            app.device_issues("m").is_empty(),
+            "{:?}",
+            app.device_issues("m")
+        );
     }
 
     #[test]

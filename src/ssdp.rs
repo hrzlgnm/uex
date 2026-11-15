@@ -170,21 +170,38 @@ pub fn spawn(
     let mut any = false;
 
     for family in [Family::V4, Family::V6] {
+        // Searching from 1900 means the listener sends too: a second
+        // socket on 1900 would receive every multicast packet twice.
+        let shared = !passive && search_port == SSDP_PORT;
+        let mut listening = false;
         match create_socket(family, SSDP_PORT) {
             Ok(sock) => {
                 any = true;
+                listening = true;
+                let qrx = shared.then(|| {
+                    let (qtx, qrx) = mpsc::channel();
+                    search_tx.push(qtx);
+                    search_ports.push(SSDP_PORT);
+                    qrx
+                });
                 let tx = tx.clone();
                 let sel = selection.clone();
                 thread::Builder::new()
                     .name(format!("ssdp-listen-{family:?}"))
-                    .spawn(move || run_socket(&sock, tx, None, family, Via::Listener, sel))?;
+                    .spawn(move || run_socket(&sock, tx, qrx, family, Via::Listener, sel))?;
             }
             Err(e) => warnings.push(format!("{family:?} listener on port {SSDP_PORT}: {e}")),
         }
-        if passive {
+        if passive || (shared && listening) {
             continue;
         }
-        match create_socket(family, search_port) {
+        // Without a 1900 listener, fall back to an ephemeral search port.
+        let port = if search_port == SSDP_PORT {
+            0
+        } else {
+            search_port
+        };
+        match create_socket(family, port) {
             Ok(sock) => {
                 any = true;
                 if let Ok(std) = sock.try_clone_std() {
