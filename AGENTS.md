@@ -23,7 +23,9 @@ Headless run (no TTY) prints discovery events to stdout.
   (a second socket on 1900 would double every multicast packet). HTTPU parse, ingress interface via IP_PKTINFO.
   Interface policy mirrors mex (`lo`/`docker`/`veth` skipped unless `-i`).
 * `src/describe.rs` — LOCATION fetch (http only, 5s, 1 MiB cap, no
-  redirects) and namespace-agnostic description parse.
+  redirects) and namespace-agnostic description parse. Link-local v6 hosts
+  connect with the advert's ingress ifindex as scope via a ureq `Resolver`
+  (semver-exempt `ureq::unversioned` API; Host header stays zone-free).
 * `src/app.rs` — advert cache keyed by UUID → USN, expiry, search
   scheduling, issue checks, selection/input.
 * `src/ui.rs` — ratatui rendering only, no state mutations.

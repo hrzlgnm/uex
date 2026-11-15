@@ -129,6 +129,8 @@ pub struct Packet {
     pub src: SocketAddr,
     pub dst: IpAddr,
     pub iface: String,
+    /// Ingress interface index: the zone for link-local LOCATION URLs.
+    pub ifindex: u32,
     pub via: Via,
     pub raw: Vec<u8>,
     pub msg: Option<Message>,
@@ -326,6 +328,7 @@ fn run_socket(
                     src: info.addr_src,
                     dst: info.addr_dst,
                     iface,
+                    ifindex,
                     via,
                     msg: parse(&raw),
                     raw,

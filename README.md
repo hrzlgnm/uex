@@ -37,6 +37,8 @@ prints one line per discovery event to stdout:
   `max-age`, the source address with its ingress interface, and any issues found.
 * **Description**: the parsed device description: identity, icons,
   services with resolved SCPD/control/event URLs, embedded devices.
+  IPv6 link-local `LOCATION`s (`http://[fe80::…]/`) are fetched through
+  the interface the advert arrived on, because a URL cannot carry the zone.
 * **Packets**: raw packets for the selection, newest first.
 
 ## Keys

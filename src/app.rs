@@ -297,6 +297,9 @@ pub struct App {
 
     pub devices: BTreeMap<String, DeviceEntry>,
     pub descriptions: HashMap<String, DescState>,
+    /// Ingress interface index per LOCATION, the zone for fetching
+    /// link-local URLs (a URL cannot carry one; RFC 6874 is unsupported).
+    scopes: HashMap<String, u32>,
     pub searches: VecDeque<SeenSearch>,
     pub packets: VecDeque<PacketEntry>,
     pub packet_total: u64,
@@ -374,6 +377,7 @@ impl App {
             fetch_rx,
             devices: BTreeMap::new(),
             descriptions: HashMap::new(),
+            scopes: HashMap::new(),
             searches: VecDeque::new(),
             packets: VecDeque::new(),
             packet_total: 0,
@@ -605,7 +609,8 @@ impl App {
         self.descriptions
             .insert(location.to_string(), DescState::Pending);
         if self.fetching {
-            describe::spawn_fetch(location.to_string(), self.fetch_tx.clone());
+            let scope = self.scopes.get(location).copied().unwrap_or(0);
+            describe::spawn_fetch(location.to_string(), scope, self.fetch_tx.clone());
         }
     }
 
@@ -829,6 +834,7 @@ impl App {
         }
         if let Some(loc) = loc {
             if describe::check_location(&loc).is_ok() {
+                self.scopes.insert(loc.clone(), p.ifindex);
                 self.request_description(&loc, refetch);
             }
         }
@@ -857,6 +863,8 @@ impl App {
             .flat_map(|d| d.adverts.values())
             .flat_map(|a| a.locations.iter().map(String::as_str))
             .collect();
+        self.scopes
+            .retain(|loc, _| referenced.contains(loc.as_str()));
         self.descriptions.retain(|loc, _| {
             let keep = referenced.contains(loc.as_str());
             if !keep {
@@ -1152,6 +1160,7 @@ mod tests {
             src: src.parse().unwrap(),
             dst: "239.255.255.250".parse().unwrap(),
             iface: "eth0".into(),
+            ifindex: 0,
             via: Via::Listener,
             raw: text.as_bytes().to_vec(),
             msg: ssdp::parse(text.as_bytes()),
@@ -1383,6 +1392,7 @@ mod tests_support {
             src: src.parse().unwrap(),
             dst: "239.255.255.250".parse().unwrap(),
             iface: "eth0".into(),
+            ifindex: 0,
             via: Via::Listener,
             msg: ssdp::parse(text.as_bytes()),
             raw: text.into_bytes(),

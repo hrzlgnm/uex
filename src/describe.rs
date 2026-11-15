@@ -4,9 +4,15 @@
 //! UPnP device description (UDA 2.0 §2.3): HTTP GET of an advertised
 //! LOCATION and a namespace-agnostic parse of the device tree.
 
+use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+// ureq's resolver hook lives in its semver-exempt `unversioned` module;
+// a breaking change there shows up as a compile error on upgrade.
+use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 
 /// Descriptions are a few KiB; anything past this is refused.
 const MAX_BODY: u64 = 1024 * 1024;
@@ -200,14 +206,57 @@ pub fn check_location(location: &str) -> Result<url::Url, String> {
     Ok(url)
 }
 
-fn fetch(location: &str) -> Result<Fetched, String> {
+/// IPv6 link-local LOCATION host (`fe80::/10`): only reachable with
+/// the zone of the link the advert arrived on.
+pub fn link_local_host(url: &url::Url) -> Option<Ipv6Addr> {
+    match url.host() {
+        Some(url::Host::Ipv6(ip)) if ip.is_unicast_link_local() => Some(ip),
+        _ => None,
+    }
+}
+
+/// Resolver that pins a link-local host to its zone (scope id), so the
+/// connect leaves through the advert's ingress interface. The HTTP Host
+/// header stays zone-free, as RFC 6874 §2 requires.
+#[derive(Debug)]
+struct ScopedResolver {
+    addr: SocketAddrV6,
+}
+
+impl Resolver for ScopedResolver {
+    fn resolve(
+        &self,
+        _uri: &ureq::http::Uri,
+        _config: &ureq::config::Config,
+        _timeout: NextTimeout,
+    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        let mut addrs = self.empty();
+        addrs.push(SocketAddr::V6(self.addr));
+        Ok(addrs)
+    }
+}
+
+fn fetch(location: &str, scope: u32) -> Result<Fetched, String> {
     let url = check_location(location)?;
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+    let config = ureq::Agent::config_builder()
         .timeout_global(Some(FETCH_TIMEOUT))
         .max_redirects(0)
         .user_agent(crate::ssdp::user_agent())
-        .build()
-        .into();
+        .build();
+    let agent = match link_local_host(&url) {
+        Some(_) if scope == 0 => return Err("link-local LOCATION without a known interface".into()),
+        Some(ip) => {
+            let port = url.port_or_known_default().unwrap_or(80);
+            ureq::Agent::with_parts(
+                config,
+                DefaultConnector::default(),
+                ScopedResolver {
+                    addr: SocketAddrV6::new(ip, port, 0, scope),
+                },
+            )
+        }
+        None => ureq::Agent::new_with_config(config),
+    };
     let start = Instant::now();
     let mut resp = agent
         .get(url.as_str())
@@ -242,11 +291,11 @@ pub type FetchResult = (String, Result<Fetched, String>);
 
 /// Fetch on a short-lived thread; the result is posted back keyed by
 /// LOCATION. Callers dedupe so each location has one fetch in flight.
-pub fn spawn_fetch(location: String, tx: mpsc::Sender<FetchResult>) {
+pub fn spawn_fetch(location: String, scope: u32, tx: mpsc::Sender<FetchResult>) {
     let _ = thread::Builder::new()
         .name("describe".into())
         .spawn(move || {
-            let res = fetch(&location);
+            let res = fetch(&location, scope);
             if let Err(e) = &res {
                 log::info!("uex: description {location}: {e}");
             }
@@ -314,6 +363,63 @@ mod tests {
             "http://10.0.0.9/ctl"
         );
         assert_eq!(resolve(loc, "", ""), "");
+    }
+
+    #[test]
+    fn detects_link_local_hosts() {
+        let ll = |u: &str| link_local_host(&url::Url::parse(u).unwrap());
+        assert!(ll("http://[fe80::1]:49000/d.xml").is_some());
+        assert!(ll("http://[fd00::1]/d.xml").is_none());
+        assert!(ll("http://[2001:db8::1]/d.xml").is_none());
+        assert!(ll("http://10.0.0.1/d.xml").is_none());
+        let err = fetch("http://[fe80::1]:49000/d.xml", 0).unwrap_err();
+        assert!(err.contains("without a known interface"), "{err}");
+    }
+
+    /// End to end over a real link-local address when the host has one
+    /// (CI runners may not): serve on `fe80::…%iface`, fetch by zone.
+    #[test]
+    fn fetches_link_local_with_scope() {
+        use std::io::{Read, Write};
+        let Some((ip, idx)) = if_addrs::get_if_addrs()
+            .unwrap_or_default()
+            .into_iter()
+            .find_map(|i| match (i.addr, i.index) {
+                (if_addrs::IfAddr::V6(v6), Some(idx)) if v6.ip.is_unicast_link_local() => {
+                    Some((v6.ip, idx))
+                }
+                _ => None,
+            })
+        else {
+            return;
+        };
+        let Ok(listener) = std::net::TcpListener::bind(SocketAddrV6::new(ip, 0, 0, idx)) else {
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        let body = "<root><device><UDN>uuid:ll</UDN></device></root>";
+        let server = thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut req = [0u8; 1024];
+            let n = conn.read(&mut req).unwrap();
+            let req = String::from_utf8_lossy(&req[..n]).to_string();
+            write!(
+                conn,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            req
+        });
+        let f = fetch(&format!("http://[{ip}]:{port}/d.xml"), idx).unwrap();
+        assert_eq!(f.description.root.udn, "uuid:ll");
+        let req = server.join().unwrap();
+        // Host header carries no zone (RFC 6874 §2).
+        assert!(
+            req.to_ascii_lowercase()
+                .contains(&format!("host: [{ip}]:{port}")),
+            "{req}"
+        );
     }
 
     #[test]
