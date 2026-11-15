@@ -41,6 +41,24 @@ Headless run (no TTY) prints discovery events to stdout.
 
 ## Workflow
 
-* Commit messages follow Conventional Commits.
+* Agents must work only in a fresh, separate worktree created from `origin/main`;
+  never edit the primary checkout or reuse a stale worktree. Create the worktree
+  (and fetch `origin` first) before making any changes.
+* Changes land via pull requests against `main`; never push to `main` directly.
+* Create branches from `origin/main` (`git fetch origin` first).
+* Each branch/PR carries one logical change. Never mix unrelated edits
+  (code, CI, docs, deps) in one branch — split them into separate PRs.
+* Commit messages must follow Conventional Commits (`feat:`, `fix:`, `docs:`,
+  …): release-please owns the changelog and derives releases from them.
+* Before opening a PR, proofread the title/body plus any new user-facing
+  text and run `typos` (CI enforces it via `typos.toml`).
+* When implementing an issue, ensure it is closed by adding `Closes #<issue>`
+  to the PR body, so GitHub auto-closes the linked issue on merge.
+
+## Conventions
+
 * `cargo fmt` before commit; clippy with `-D warnings` must pass.
-* No new deps without need.
+* Prefer editing existing files; no new deps without need.
+* Random jitter uses the std-only `rand_u32` helper in `app.rs`.
+* Header values, XML text, and HTTP bodies are untrusted network input:
+  escape control characters before rendering (`describe::printable`).
