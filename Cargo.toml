@@ -29,7 +29,7 @@ clap = { version = "4", features = ["derive"] }
 # are served over http:// on the LAN, so no TLS stack is pulled in.
 ureq = { version = "3", default-features = false }
 # Read-only DOM for device description XML (UDA 2.0 §2).
-roxmltree = "0.20"
+roxmltree = "0.21"
 url = "2"
 
 [target.'cfg(unix)'.dependencies]
