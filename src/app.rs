@@ -151,7 +151,7 @@ impl DeviceEntry {
 pub enum DescState {
     Pending,
     Ready(Box<Fetched>),
-    Failed(String),
+    Failed(describe::FetchError),
 }
 
 #[derive(Clone, Debug)]
@@ -524,7 +524,7 @@ impl App {
         }
     }
 
-    fn on_fetched(&mut self, location: String, res: Result<Fetched, String>) {
+    fn on_fetched(&mut self, location: String, res: Result<Fetched, describe::FetchError>) {
         // Dropped meanwhile (all adverts expired): don't resurrect.
         if !self.descriptions.contains_key(&location) {
             return;

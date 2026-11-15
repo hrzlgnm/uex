@@ -39,6 +39,9 @@ prints one line per discovery event to stdout:
   services with resolved SCPD/control/event URLs, embedded devices.
   IPv6 link-local `LOCATION`s (`http://[fe80::…]/`) are fetched through
   the interface the advert arrived on, because a URL cannot carry the zone.
+  When a fetch fails, the view shows what the server sent: status,
+  `Content-Type`, size, and the first lines of the body. XML errors
+  quote the text at the failing position.
 * **Packets**: raw packets for the selection, newest first.
 
 ## Keys

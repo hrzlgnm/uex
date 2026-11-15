@@ -155,9 +155,62 @@ fn parse_device(node: roxmltree::Node) -> Device {
     }
 }
 
+/// Lines and characters kept from a failed body for display.
+const PREVIEW_LINES: usize = 12;
+const PREVIEW_LINE_CHARS: usize = 160;
+
+/// Printable form of untrusted text: control characters (bar tab) are
+/// escaped so a hostile body cannot drive the terminal.
+fn printable(s: &str) -> String {
+    s.chars()
+        .flat_map(|c| {
+            if c.is_control() && c != '\t' {
+                c.escape_default().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
+}
+
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        let mut out: String = s.chars().take(max).collect();
+        out.push('…');
+        out
+    } else {
+        s.to_string()
+    }
+}
+
+/// Up to 60 characters around a 1-based (row, col) position, quoted:
+/// enough to see what the parser tripped over.
+pub fn excerpt(text: &str, row: u32, col: u32) -> String {
+    let line = text
+        .lines()
+        .nth(row.saturating_sub(1) as usize)
+        .unwrap_or("");
+    let at = col.saturating_sub(1) as usize;
+    let start = at.saturating_sub(20);
+    let window: String = line.chars().skip(start).take(60).collect();
+    let lead = if start > 0 { "…" } else { "" };
+    let tail = if line.chars().count() > start + 60 {
+        "…"
+    } else {
+        ""
+    };
+    format!("\"{lead}{}{tail}\"", printable(&window))
+}
+
 pub fn parse(xml: &str) -> Result<Description, String> {
     let xml = xml.trim_start_matches('\u{feff}').trim_start();
-    let doc = roxmltree::Document::parse(xml).map_err(|e| format!("XML: {e}"))?;
+    if xml.is_empty() {
+        return Err("empty body".into());
+    }
+    let doc = roxmltree::Document::parse(xml).map_err(|e| {
+        let pos = e.pos();
+        format!("XML: {e} near {}", excerpt(xml, pos.row, pos.col))
+    })?;
     let root = doc.root_element();
     if root.tag_name().name() != "root" {
         return Err(format!(
@@ -236,10 +289,73 @@ impl Resolver for ScopedResolver {
     }
 }
 
-fn fetch(location: &str, scope: u32) -> Result<Fetched, String> {
+/// What the server sent alongside a failure: status, headers, and the
+/// first lines of the body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BodyPreview {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub server: Option<String>,
+    pub bytes: usize,
+    pub lines: Vec<String>,
+    /// Lines past `PREVIEW_LINES` that were cut.
+    pub more_lines: usize,
+}
+
+impl BodyPreview {
+    fn new(status: u16, content_type: Option<String>, server: Option<String>, body: &[u8]) -> Self {
+        let text = String::from_utf8_lossy(body);
+        let all: Vec<&str> = text.lines().collect();
+        BodyPreview {
+            status,
+            content_type,
+            server,
+            bytes: body.len(),
+            lines: all
+                .iter()
+                .take(PREVIEW_LINES)
+                .map(|l| clip(&printable(l), PREVIEW_LINE_CHARS))
+                .collect(),
+            more_lines: all.len().saturating_sub(PREVIEW_LINES),
+        }
+    }
+}
+
+/// A failed fetch: one-line message (used in issue lists) plus the body
+/// preview when the server answered at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FetchError {
+    pub message: String,
+    pub body: Option<BodyPreview>,
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<String> for FetchError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            body: None,
+        }
+    }
+}
+
+impl From<&str> for FetchError {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+fn fetch(location: &str, scope: u32) -> Result<Fetched, FetchError> {
     let url = check_location(location)?;
     let config = ureq::Agent::config_builder()
         .timeout_global(Some(FETCH_TIMEOUT))
+        // Non-2xx bodies are kept for the preview instead of an opaque error.
+        .http_status_as_error(false)
         .max_redirects(0)
         .user_agent(crate::ssdp::user_agent())
         .build();
@@ -261,7 +377,8 @@ fn fetch(location: &str, scope: u32) -> Result<Fetched, String> {
     let mut resp = agent
         .get(url.as_str())
         .call()
-        .map_err(|e| format!("GET failed: {e}"))?;
+        .map_err(|e| FetchError::from(format!("GET failed: {e}")))?;
+    let status = resp.status().as_u16();
     let header = |name: &str| {
         resp.headers()
             .get(name)
@@ -275,9 +392,21 @@ fn fetch(location: &str, scope: u32) -> Result<Fetched, String> {
         .with_config()
         .limit(MAX_BODY)
         .read_to_vec()
-        .map_err(|e| format!("reading body: {e}"))?;
+        .map_err(|e| FetchError::from(format!("reading body: {e}")))?;
     let elapsed = start.elapsed();
-    let description = parse(&String::from_utf8_lossy(&body))?;
+    let failed = |message: String| FetchError {
+        message,
+        body: Some(BodyPreview::new(
+            status,
+            content_type.clone(),
+            server.clone(),
+            &body,
+        )),
+    };
+    if !(200..300).contains(&status) {
+        return Err(failed(format!("HTTP {status}")));
+    }
+    let description = parse(&String::from_utf8_lossy(&body)).map_err(failed)?;
     Ok(Fetched {
         description,
         server,
@@ -287,7 +416,7 @@ fn fetch(location: &str, scope: u32) -> Result<Fetched, String> {
     })
 }
 
-pub type FetchResult = (String, Result<Fetched, String>);
+pub type FetchResult = (String, Result<Fetched, FetchError>);
 
 /// Fetch on a short-lived thread; the result is posted back keyed by
 /// LOCATION. Callers dedupe so each location has one fetch in flight.
@@ -373,7 +502,7 @@ mod tests {
         assert!(ll("http://[2001:db8::1]/d.xml").is_none());
         assert!(ll("http://10.0.0.1/d.xml").is_none());
         let err = fetch("http://[fe80::1]:49000/d.xml", 0).unwrap_err();
-        assert!(err.contains("without a known interface"), "{err}");
+        assert!(err.message.contains("without a known interface"), "{err}");
     }
 
     /// End to end over a real link-local address when the host has one
@@ -420,6 +549,68 @@ mod tests {
                 .contains(&format!("host: [{ip}]:{port}")),
             "{req}"
         );
+    }
+
+    #[test]
+    fn parse_errors_quote_the_offending_text() {
+        let err = parse("status=ok").unwrap_err();
+        assert!(err.starts_with("XML: "), "{err}");
+        assert!(err.ends_with("near \"status=ok\""), "{err}");
+        assert_eq!(parse("  \n").unwrap_err(), "empty body");
+        let long = format!("<root>\n<a>{}<b></a>", "x".repeat(100));
+        let err = parse(&long).unwrap_err();
+        assert!(err.contains("near \"…"), "{err}");
+        // Control characters are escaped, never passed to the terminal.
+        assert_eq!(excerpt("a\x1b[2Jb", 1, 1), "\"a\\u{1b}[2Jb\"");
+    }
+
+    #[test]
+    fn body_preview_caps_lines_and_width() {
+        let body: String = (0..20)
+            .map(|i| format!("line {i} {}\n", "y".repeat(200)))
+            .collect();
+        let p = BodyPreview::new(404, Some("text/plain".into()), None, body.as_bytes());
+        assert_eq!(p.lines.len(), PREVIEW_LINES);
+        assert_eq!(p.more_lines, 8);
+        assert!(p.lines[0].ends_with('…'));
+        assert_eq!(p.lines[0].chars().count(), PREVIEW_LINE_CHARS + 1);
+    }
+
+    /// Serve one canned HTTP response on loopback, return the URL.
+    fn serve_once(response: &'static str) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let _ = conn.read(&mut [0u8; 1024]);
+            conn.write_all(response.as_bytes()).unwrap();
+        });
+        format!("http://127.0.0.1:{port}/d.xml")
+    }
+
+    #[test]
+    fn failed_fetches_keep_a_body_preview() {
+        let url = serve_once(
+            "HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nContent-Length: 22\r\n\
+             Connection: close\r\n\r\n<h1>no such page</h1>\n",
+        );
+        let err = fetch(&url, 0).unwrap_err();
+        assert_eq!(err.message, "HTTP 404");
+        let body = err.body.unwrap();
+        assert_eq!(body.status, 404);
+        assert_eq!(body.content_type.as_deref(), Some("text/html"));
+        assert_eq!(body.lines, ["<h1>no such page</h1>"]);
+
+        let url = serve_once(
+            "HTTP/1.1 200 OK\r\nServer: NRDP/1\r\nContent-Length: 9\r\n\
+             Connection: close\r\n\r\nstatus=ok",
+        );
+        let err = fetch(&url, 0).unwrap_err();
+        assert!(err.message.contains("near \"status=ok\""), "{err}");
+        let body = err.body.unwrap();
+        assert_eq!((body.status, body.content_type, body.bytes), (200, None, 9));
+        assert_eq!(body.server.as_deref(), Some("NRDP/1"));
     }
 
     #[test]

@@ -600,6 +600,37 @@ fn device_lines(lines: &mut Vec<Line<'static>>, d: &Device, loc: &str, base: &st
     }
 }
 
+/// What the server sent instead of a description, so a wrong endpoint
+/// or an error page is recognizable at a glance.
+fn body_preview_lines(lines: &mut Vec<Line<'static>>, b: &describe::BodyPreview) {
+    let mut meta = vec![format!("HTTP {}", b.status)];
+    meta.push(
+        b.content_type
+            .clone()
+            .unwrap_or_else(|| "no Content-Type".into()),
+    );
+    meta.push(format!("{} bytes", b.bytes));
+    if let Some(server) = &b.server {
+        meta.push(format!("server {server}"));
+    }
+    lines.push(Line::styled(format!("  {}", meta.join(" · ")), DIM));
+    if b.lines.is_empty() {
+        lines.push(Line::styled("  │ (empty body)", DIM));
+    }
+    for l in &b.lines {
+        lines.push(Line::from(vec![
+            Span::styled("  │ ", DIM),
+            Span::raw(l.clone()),
+        ]));
+    }
+    if b.more_lines > 0 {
+        lines.push(Line::styled(
+            format!("  │ … {} more line(s)", b.more_lines),
+            DIM,
+        ));
+    }
+}
+
 fn draw_description(frame: &mut Frame, area: Rect, app: &App, uuid: &str) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let states = app.description_states(uuid);
@@ -628,6 +659,9 @@ fn draw_description(frame: &mut Frame, area: Rect, app: &App, uuid: &str) {
             ),
         };
         lines.push(Line::from(vec![Span::raw(format!("{loc}  ")), status]));
+        if let DescState::Failed(describe::FetchError { body: Some(b), .. }) = st {
+            body_preview_lines(&mut lines, b);
+        }
     }
     if let Some((loc, f, dev)) = app.described(uuid) {
         let d = &f.description;
