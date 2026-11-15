@@ -23,6 +23,7 @@ use ratatui::Frame;
 
 use crate::app::{short_type, source_label, AdvertVia, App, DescState, RowKey, Tab};
 use crate::describe::{self, Device};
+use crate::issues::{worst_mark, Issue, Severity};
 
 pub type Terminal = ratatui::Terminal<CrosstermBackend<io::Stdout>>;
 
@@ -74,6 +75,23 @@ const DIM: Style = Style::new().fg(Color::DarkGray);
 const KEY: Style = Style::new().fg(Color::Cyan);
 const WARN: Style = Style::new().fg(Color::Yellow);
 const BAD: Style = Style::new().fg(Color::Red);
+const INFO: Style = Style::new().fg(Color::Blue);
+
+fn severity_style(s: Severity) -> Style {
+    match s {
+        Severity::Error => BAD,
+        Severity::Warning => WARN,
+        Severity::Info => INFO,
+    }
+}
+
+/// `!` in the worst marking severity's color, or nothing.
+fn mark_span(issues: &[Issue]) -> Span<'static> {
+    match worst_mark(issues) {
+        Some(s) => Span::styled("!", severity_style(s)),
+        None => Span::raw(""),
+    }
+}
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let chunks = Layout::default()
@@ -87,9 +105,87 @@ pub fn draw(frame: &mut Frame, app: &App) {
         .split(chunks[1]);
     draw_device_list(frame, body[0], app);
     draw_detail(frame, body[1], app);
+    if app.show_metrics {
+        draw_metrics_overlay(frame, app);
+    }
     if let Some(text) = app.status_text() {
         draw_popup(frame, text);
     }
+}
+
+fn centered_rect(pct_x: u16, pct_y: u16, area: Rect) -> Rect {
+    let w = area.width * pct_x / 100;
+    let h = area.height * pct_y / 100;
+    Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.y + (area.height - h) / 2,
+        width: w,
+        height: h,
+    }
+}
+
+/// Metrics overlay (`m`), laid out like mex's: frozen key column sized
+/// to the longest key, values pan horizontally, rows scroll.
+fn draw_metrics_overlay(frame: &mut Frame, app: &App) {
+    let area = centered_rect(85, 85, frame.area());
+    frame.render_widget(Clear, area);
+    let rows = app.metrics_rows();
+    let viewport = (area.height as usize).saturating_sub(4);
+    app.metrics_viewport.set(viewport);
+    let max_offset = rows.len().saturating_sub(viewport);
+    let offset = app.metrics_scroll.get().min(max_offset);
+    app.metrics_scroll.set(offset);
+
+    let key_cap = area.width.saturating_sub(12).clamp(10, 40) as usize;
+    let key_w = rows
+        .iter()
+        .filter(|(_, v)| !v.is_empty())
+        .map(|(k, _)| k.chars().count() + 2)
+        .max()
+        .unwrap_or(10)
+        .clamp(10, 40)
+        .min(key_cap) as u16;
+    let value_w = (area.width as usize).saturating_sub(key_w as usize + 5);
+    let longest = rows
+        .iter()
+        .map(|(_, v)| v.chars().count())
+        .max()
+        .unwrap_or(0);
+    let hscroll = app
+        .metrics_hscroll
+        .get()
+        .min(longest.saturating_sub(value_w.max(1)));
+    app.metrics_hscroll.set(hscroll);
+
+    let section = Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let body: Vec<Row> = rows
+        .into_iter()
+        .map(|(k, v)| {
+            if v.is_empty() {
+                return Row::new(vec![Cell::from(k).style(section), Cell::from("")]);
+            }
+            let key_style = match k.chars().next() {
+                Some(c) if c == Severity::Error.icon() => BAD,
+                Some(c) if c == Severity::Warning.icon() => WARN,
+                Some(c) if c == Severity::Info.icon() => INFO,
+                _ => Style::new().fg(Color::Gray),
+            };
+            let shifted: String = v.chars().skip(hscroll).collect();
+            Row::new(vec![
+                Cell::from(format!(" {k}")).style(key_style),
+                Cell::from(shifted),
+            ])
+        })
+        .collect();
+    let table = Table::new(body, [Constraint::Length(key_w), Constraint::Min(0)])
+        .header(Row::new(["METRIC", "VALUE"]).style(section))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Metrics (m/Esc close · j/k ↕ · h/l ↔) "),
+        );
+    let mut state = TableState::default().with_offset(offset);
+    frame.render_stateful_widget(table, area, &mut state);
 }
 
 fn fmt_secs(d: Duration) -> String {
@@ -146,6 +242,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
             ("r", "rescan"),
             ("f", "refetch"),
             ("c", "clear log"),
+            ("m", "metrics"),
             ("q", "quit"),
         ];
         Line::from(
@@ -189,8 +286,10 @@ fn draw_device_list(frame: &mut Frame, area: Rect, app: &App) {
                 let name_style = if dev.live() { Style::new() } else { DIM };
                 spans.push(Span::styled(app.display_name(uuid), name_style));
                 spans.push(Span::styled(format!("  {}", dev.adverts.len()), DIM));
-                if !app.device_issues(uuid).is_empty() {
-                    spans.push(Span::styled(" !", WARN));
+                let issues = app.device_issues(uuid);
+                if worst_mark(&issues).is_some() {
+                    spans.push(Span::raw(" "));
+                    spans.push(mark_span(&issues));
                 }
                 ListItem::new(Line::from(spans))
             }
@@ -258,13 +357,15 @@ fn draw_searches(frame: &mut Frame, area: Rect, app: &App) {
             } else {
                 Cell::from(source_label(&s.src, &s.iface))
             };
-            let ua = if s.issues.is_empty() {
-                Cell::from(s.user_agent.clone())
-            } else {
-                Cell::from(Line::from(vec![
-                    Span::styled(format!("! {} ", s.issues.join("; ")), WARN),
-                    Span::raw(s.user_agent.clone()),
-                ]))
+            let ua = match worst_mark(&s.issues) {
+                None => Cell::from(s.user_agent.clone()),
+                Some(sev) => {
+                    let text: Vec<&str> = s.issues.iter().map(|i| i.text.as_str()).collect();
+                    Cell::from(Line::from(vec![
+                        Span::styled(format!("! {} ", text.join("; ")), severity_style(sev)),
+                        Span::raw(s.user_agent.clone()),
+                    ]))
+                }
             };
             Row::new(vec![
                 Cell::from(
@@ -376,9 +477,8 @@ fn draw_adverts(frame: &mut Frame, area: Rect, app: &App, uuid: &str) {
                 Some(_) => fmt_secs(rem),
                 None => format!("{}?", fmt_secs(rem)),
             };
-            let mark = if a.issues.is_empty() { "" } else { "!" };
             Row::new(vec![
-                Cell::from(Span::styled(mark, WARN)),
+                Cell::from(mark_span(&a.issues)),
                 Cell::from(short_type(&a.target).to_string()),
                 Cell::from(Span::styled(via, via_style)),
                 Cell::from(Span::styled(ttl, ttl_style)),
@@ -409,7 +509,12 @@ fn draw_adverts(frame: &mut Frame, area: Rect, app: &App, uuid: &str) {
 
     if !issues.is_empty() {
         let mut lines = vec![Line::styled("Issues", WARN.add_modifier(Modifier::BOLD))];
-        lines.extend(issues.iter().map(|i| Line::styled(format!("• {i}"), WARN)));
+        lines.extend(issues.iter().map(|i| {
+            Line::styled(
+                format!("{} {}", i.severity.icon(), i.text),
+                severity_style(i.severity),
+            )
+        }));
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), parts[2]);
     }
 }

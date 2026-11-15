@@ -51,6 +51,7 @@ prints one line per discovery event to stdout:
 | `r` | rescan (restart the search burst) |
 | `f` | refetch the selected device's description |
 | `c` | clear packet log |
+| `m` | metrics overlay (`j`/`k` scroll, `h`/`l` pan, `m`/`Esc` close) |
 | `Ctrl+Z` | suspend |
 | `q`, `Esc`, `Ctrl+C` | quit |
 
@@ -80,7 +81,31 @@ To see IPv6 SSDP traffic under ufw, also allow port 1900 from
 `fe80::/10` and allow `ff02::c` in `/etc/ufw/before6.rules`. The stock
 rules only allow the IPv4 group.
 
+## Metrics
+
+`m` opens a scrollable overlay modeled on mex's. It has these sections:
+
+* **Session**: uptime, packets per IP family, packet rates, bytes, last packet.
+* **Traffic**: NOTIFY broken down by NTS, search replies, M-SEARCH seen
+  (foreign vs. our own looped back), and which socket received what.
+* **Discovery**: devices (current, ever, expired, byebye), the tree shape,
+  adverts by origin, the `max-age` distribution, the next expiry,
+  advertised types, and the most common `SERVER` strings.
+* **Descriptions**: fetch states, link-local fetches, timing and size,
+  UPnP spec versions, and the number of services described.
+* **Searching**: mode, ST/MX/port, rounds sent, the next search, and
+  replies per round.
+* **Control points**: other hosts sending M-SEARCH with their
+  `USER-AGENT` (hosts on this machine are tagged), plus their search targets.
+* **Links**: joined interfaces, packets received per interface, top talkers.
+* **Issues**: every current finding, worst first, grouped by device or
+  control point.
+
 ## Checks
+
+Each finding has a severity: error (breaks interoperability), warning
+(deviates from a SHOULD), or info (notable but legitimate). Errors and
+warnings mark rows with a colored `!`.
 
 Advertisements are checked against UDA 2.0 §1. Checks cover required
 headers per message type, `CACHE-CONTROL: max-age` (missing or below

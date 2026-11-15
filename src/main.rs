@@ -3,6 +3,8 @@
 
 mod app;
 mod describe;
+mod issues;
+mod metrics;
 mod ssdp;
 mod ui;
 

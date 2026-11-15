@@ -4,6 +4,7 @@
 //! Browser state: advertisement cache keyed by device UUID and USN,
 //! description fetches, search scheduling, expiry, and selection.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +15,8 @@ use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::describe::{self, FetchResult, Fetched};
+use crate::issues::{advert_issues, search_issues, Issue};
+use crate::metrics::Metrics;
 use crate::ssdp::{self, Kind, Message, Packet, SearchRequest, Transport};
 use crate::ui;
 
@@ -116,7 +119,7 @@ pub struct Advert {
     pub boot_id: Option<String>,
     pub config_id: Option<String>,
     pub count: u64,
-    pub issues: Vec<String>,
+    pub issues: Vec<Issue>,
     pub gone: Option<Instant>,
 }
 
@@ -160,7 +163,7 @@ pub struct SeenSearch {
     pub mx: String,
     pub user_agent: String,
     pub own: bool,
-    pub issues: Vec<String>,
+    pub issues: Vec<Issue>,
 }
 
 #[derive(Clone, Debug)]
@@ -198,100 +201,21 @@ pub struct Row {
     pub depth: usize,
 }
 
-/// Header checks for one advertisement message (UDA 2.0 §1.2, §1.3).
-/// Pure, so the rules are unit-tested without sockets.
-pub fn advert_issues(msg: &Message, src: &SocketAddr) -> Vec<String> {
-    let mut out = Vec::new();
-    let nts = msg.header("NTS").unwrap_or("");
-    let byebye = nts.eq_ignore_ascii_case("ssdp:byebye");
-    let required: &[&str] = match msg.kind {
-        Kind::Notify if byebye => &["HOST", "NT", "NTS", "USN"],
-        Kind::Notify => &[
-            "HOST",
-            "CACHE-CONTROL",
-            "LOCATION",
-            "NT",
-            "NTS",
-            "SERVER",
-            "USN",
-        ],
-        Kind::Response => &["CACHE-CONTROL", "EXT", "LOCATION", "SERVER", "ST", "USN"],
-        Kind::Search => &[],
-    };
-    for h in required {
-        if !msg.has_header(h) {
-            out.push(format!("missing {h} header"));
-        }
-    }
-    if msg.malformed_lines > 0 {
-        out.push(format!("{} malformed header line(s)", msg.malformed_lines));
-    }
-    if msg.kind == Kind::Response && msg.status() != Some(200) {
-        out.push(format!("status line '{}' (want 200)", msg.start_line));
-    }
-    if msg.kind == Kind::Notify
-        && !["ssdp:alive", "ssdp:byebye", "ssdp:update"]
-            .iter()
-            .any(|v| nts.eq_ignore_ascii_case(v))
-        && msg.has_header("NTS")
-    {
-        out.push(format!("unknown NTS '{nts}'"));
-    }
-    if let Some(cc) = msg.header("CACHE-CONTROL") {
-        match parse_max_age(cc) {
-            None => out.push(format!("CACHE-CONTROL without max-age: '{cc}'")),
-            Some(n) if n < 1800 => out.push(format!("max-age={n} below recommended 1800")),
-            _ => {}
-        }
-    }
-    let target = match msg.kind {
-        Kind::Notify => msg.header("NT"),
-        _ => msg.header("ST"),
-    };
-    if let Some(usn) = msg.header("USN") {
-        if usn_uuid(usn).is_none() {
-            out.push(format!("USN '{usn}' does not start with uuid:"));
-        } else if let Some(t) = target {
-            // Root/uuid adverts have their own USN shapes; typed ones
-            // are `uuid:<id>::<NT>`.
-            let typed = !t.to_ascii_lowercase().starts_with("uuid:");
-            let suffix = usn.split_once("::").map(|(_, s)| s);
-            if typed && suffix.is_some_and(|s| !s.eq_ignore_ascii_case(t)) {
-                out.push(format!("USN suffix does not match {t}"));
-            }
-            if typed && suffix.is_none() {
-                out.push(format!("USN lacks '::{t}' suffix"));
-            }
-        }
-    }
-    if let Some(loc) = msg.header("LOCATION") {
-        match describe::check_location(loc) {
-            Err(e) => out.push(e),
-            Ok(url) => {
-                let host_ip = match url.host() {
-                    Some(url::Host::Ipv4(ip)) => Some(IpAddr::V4(ip)),
-                    Some(url::Host::Ipv6(ip)) => Some(IpAddr::V6(ip)),
-                    _ => None,
-                };
-                if host_ip.is_some_and(|ip| ip != src.ip()) {
-                    out.push(format!("LOCATION host differs from sender {}", src.ip()));
-                }
-            }
-        }
-    }
-    if let Some(server) = msg.header("SERVER") {
-        if !server.to_ascii_uppercase().contains("UPNP/") {
-            out.push(format!("SERVER '{server}' lacks UPnP/x.y token"));
-        }
-    }
-    out
-}
-
 pub struct App {
     rx: mpsc::Receiver<Packet>,
     search_tx: Vec<mpsc::Sender<SearchRequest>>,
-    search_ports: Vec<u16>,
-    local_ips: HashSet<IpAddr>,
+    pub(crate) search_ports: Vec<u16>,
+    pub(crate) local_ips: HashSet<IpAddr>,
+    pub(crate) selection: Option<HashSet<String>>,
+    /// Joined v4/v6 link names, refreshed every 10s for the metrics view.
+    pub(crate) links: (Vec<String>, Vec<String>),
+    links_at: Option<Instant>,
+    pub metrics: Metrics,
+    pub show_metrics: bool,
+    /// Overlay scroll state; the renderer clamps and writes back.
+    pub metrics_scroll: Cell<usize>,
+    pub metrics_hscroll: Cell<usize>,
+    pub metrics_viewport: Cell<usize>,
     fetch_tx: mpsc::Sender<FetchResult>,
     fetch_rx: mpsc::Receiver<FetchResult>,
 
@@ -347,12 +271,13 @@ impl App {
             search_tx,
             search_ports,
             warnings,
-        } = ssdp::spawn(opts.selection, opts.passive, opts.search_port)?;
+        } = ssdp::spawn(opts.selection.clone(), opts.passive, opts.search_port)?;
         let (fetch_tx, fetch_rx) = mpsc::channel();
         let mut app = Self::with_channels(rx, fetch_tx, fetch_rx, opts.passive, headless);
         app.search_tx = search_tx;
         app.search_ports = search_ports;
         app.local_ips = ssdp::local_ips();
+        app.selection = opts.selection;
         app.warnings = warnings;
         app.mx = opts.mx;
         app.targets = opts.targets;
@@ -373,6 +298,14 @@ impl App {
             search_tx: Vec::new(),
             search_ports: Vec::new(),
             local_ips: HashSet::new(),
+            selection: None,
+            links: (Vec::new(), Vec::new()),
+            links_at: None,
+            metrics: Metrics::default(),
+            show_metrics: false,
+            metrics_scroll: Cell::new(0),
+            metrics_hscroll: Cell::new(0),
+            metrics_viewport: Cell::new(0),
             fetch_tx,
             fetch_rx,
             devices: BTreeMap::new(),
@@ -412,6 +345,14 @@ impl App {
     }
 
     fn tick(&mut self) {
+        if self
+            .links_at
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(10))
+        {
+            self.links_at = Some(Instant::now());
+            self.links = ssdp::usable_links(self.selection.as_ref());
+            self.local_ips = ssdp::local_ips();
+        }
         self.drain();
         self.send_searches();
         self.evict(Instant::now());
@@ -532,6 +473,11 @@ impl App {
         self.interval = FIRST_INTERVAL;
     }
 
+    /// Current rescan interval (the gap after the next search).
+    pub fn search_interval(&self) -> Duration {
+        self.interval
+    }
+
     pub fn next_search_in(&self) -> Option<Duration> {
         self.next_search
             .map(|t| t.saturating_duration_since(Instant::now()))
@@ -585,6 +531,11 @@ impl App {
         }
         match res {
             Ok(f) => {
+                let ms = f.elapsed.as_millis() as u64;
+                self.metrics.fetch_ok += 1;
+                self.metrics.fetch_bytes += f.bytes as u64;
+                self.metrics.fetch_ms_total += ms;
+                self.metrics.fetch_ms_max = self.metrics.fetch_ms_max.max(ms);
                 self.note(format!(
                     "= {} \"{}\" ({})",
                     f.description.root.udn, f.description.root.friendly_name, location
@@ -593,6 +544,7 @@ impl App {
                     .insert(location, DescState::Ready(Box::new(f)));
             }
             Err(e) => {
+                self.metrics.fetch_failed += 1;
                 self.descriptions.insert(location, DescState::Failed(e));
             }
         }
@@ -608,6 +560,14 @@ impl App {
         log::debug!("uex: fetch {location} (force={force})");
         self.descriptions
             .insert(location.to_string(), DescState::Pending);
+        self.metrics.fetch_started += 1;
+        if url::Url::parse(location)
+            .ok()
+            .and_then(|u| describe::link_local_host(&u))
+            .is_some()
+        {
+            self.metrics.fetch_link_local += 1;
+        }
         if self.fetching {
             let scope = self.scopes.get(location).copied().unwrap_or(0);
             describe::spawn_fetch(location.to_string(), scope, self.fetch_tx.clone());
@@ -626,6 +586,7 @@ impl App {
             self.responses += 1;
         }
         let own = matches!(&p.msg, Some(m) if m.kind == Kind::Search) && self.is_own(&p);
+        self.metrics.on_packet(&p, own);
         let (summary, uuid) = match &p.msg {
             None => {
                 self.unparsed += 1;
@@ -654,24 +615,7 @@ impl App {
     }
 
     fn on_search(&mut self, p: &Packet, m: &Message, own: bool) {
-        let mut issues = Vec::new();
-        for h in ["HOST", "MAN", "ST"] {
-            if !m.has_header(h) {
-                issues.push(format!("missing {h}"));
-            }
-        }
-        if m.header("MAN").is_some_and(|v| v != "\"ssdp:discover\"") {
-            issues.push("MAN must be \"ssdp:discover\" (quoted)".into());
-        }
-        let multicast = p.dst.is_multicast();
-        match m.header("MX").map(str::parse::<u32>) {
-            None if multicast => issues.push("multicast search without MX".into()),
-            Some(Err(_)) => issues.push("MX not a number".into()),
-            Some(Ok(n)) if multicast && !(1..=5).contains(&n) => {
-                issues.push(format!("MX={n} outside 1..5"))
-            }
-            _ => {}
-        }
+        let issues = search_issues(m, p.dst.is_multicast());
         self.searches.push_back(SeenSearch {
             at: p.at,
             src: p.src,
@@ -722,7 +666,7 @@ impl App {
                     a.count += 1;
                 }
                 None => {
-                    issues.push("byebye for an advert never seen alive".into());
+                    issues.push(Issue::info("byebye for an advert never seen alive"));
                     dev.adverts.insert(
                         key,
                         Advert {
@@ -747,6 +691,7 @@ impl App {
             }
             let all_gone = !dev.live();
             if all_gone {
+                self.metrics.devices_byebye_total += 1;
                 self.note(format!("- uuid:{uuid} byebye"));
             }
             return;
@@ -765,11 +710,11 @@ impl App {
                     }
                 } else {
                     if boot_id.is_some() && a.boot_id.is_some() && boot_id != a.boot_id {
-                        issues.push(format!(
+                        issues.push(Issue::warning(format!(
                             "BOOTID changed {} → {} without ssdp:update",
                             a.boot_id.as_deref().unwrap_or(""),
                             boot_id.as_deref().unwrap_or("")
-                        ));
+                        )));
                     }
                     a.boot_id = boot_id.or(a.boot_id.take());
                     a.refreshed = now;
@@ -826,6 +771,7 @@ impl App {
         }
         let loc = dev.adverts.get(&key).and_then(|a| a.location.clone());
         if new_device {
+            self.metrics.devices_seen_total += 1;
             self.note(format!(
                 "+ uuid:{uuid} {} {}",
                 loc.as_deref().unwrap_or("-"),
@@ -855,6 +801,7 @@ impl App {
         }
         for uuid in expired {
             self.devices.remove(&uuid);
+            self.metrics.devices_expired_total += 1;
             self.note(format!("x uuid:{uuid} expired"));
         }
         let referenced: HashSet<&str> = self
@@ -918,15 +865,16 @@ impl App {
             .unwrap_or_else(|| format!("uuid:{uuid}"))
     }
 
-    /// Advert issues plus description-level findings, deduplicated.
-    pub fn device_issues(&self, uuid: &str) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
+    /// Advert issues plus description-level findings, deduplicated and
+    /// sorted worst first.
+    pub fn device_issues(&self, uuid: &str) -> Vec<Issue> {
+        let mut out: Vec<Issue> = Vec::new();
         let Some(dev) = self.devices.get(uuid) else {
             return out;
         };
-        let mut push = |s: String| {
-            if !out.contains(&s) {
-                out.push(s);
+        let mut push = |i: Issue| {
+            if !out.contains(&i) {
+                out.push(i);
             }
         };
         for a in dev.adverts.values() {
@@ -943,13 +891,16 @@ impl App {
             .any(|(_, st)| matches!(st, DescState::Ready(_)));
         for (loc, st) in states {
             match st {
-                DescState::Failed(e) if !any_ready => push(format!("description {loc}: {e}")),
-                DescState::Ready(f) if f.description.root.find(&udn).is_none() => {
-                    push(format!("{udn} not found in description {loc}"))
+                DescState::Failed(e) if !any_ready => {
+                    push(Issue::error(format!("description {loc}: {e}")))
                 }
+                DescState::Ready(f) if f.description.root.find(&udn).is_none() => push(
+                    Issue::error(format!("{udn} not found in description {loc}")),
+                ),
                 _ => {}
             }
         }
+        out.sort_by_key(|i| i.severity);
         out
     }
 
@@ -1068,9 +1019,57 @@ impl App {
         self.scroll = 0;
     }
 
+    fn scroll_metrics(&self, delta: isize) {
+        let v = self.metrics_scroll.get() as isize + delta;
+        self.metrics_scroll.set(v.max(0) as usize);
+    }
+
+    fn pan_metrics(&self, delta: isize) {
+        let v = self.metrics_hscroll.get() as isize + delta;
+        self.metrics_hscroll.set(v.max(0) as usize);
+    }
+
+    /// While open the overlay owns every key except Ctrl+C/Ctrl+Z:
+    /// `m`/`Esc` close, `q` quits, the rest scrolls (as in mex).
+    fn handle_metrics_key(&mut self, key: &KeyEvent) {
+        let page = self.metrics_viewport.get().max(1) as isize;
+        let step = if key.modifiers.contains(KeyModifiers::CONTROL) {
+            10
+        } else {
+            1
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('m') | KeyCode::Char('M') => self.show_metrics = false,
+            KeyCode::Char('q') => self.running = false,
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => self.scroll_metrics(-1),
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => self.scroll_metrics(1),
+            KeyCode::PageUp | KeyCode::Char('b') => self.scroll_metrics(-page),
+            KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_metrics(page),
+            KeyCode::Home | KeyCode::Char('g') => self.metrics_scroll.set(0),
+            KeyCode::End | KeyCode::Char('G') => self.metrics_scroll.set(usize::MAX / 2),
+            KeyCode::Left | KeyCode::Char('h') => self.pan_metrics(-step),
+            KeyCode::Right | KeyCode::Char('l') => self.pan_metrics(step),
+            KeyCode::Char('0') => self.metrics_hscroll.set(0),
+            _ => {}
+        }
+    }
+
     pub fn handle_key(&mut self, key: &KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && key.code == KeyCode::Char('c') {
+            self.running = false;
+            return;
+        }
+        if self.show_metrics {
+            self.handle_metrics_key(key);
+            return;
+        }
         match key.code {
+            KeyCode::Char('m') | KeyCode::Char('M') => {
+                self.show_metrics = true;
+                self.metrics_scroll.set(0);
+                self.metrics_hscroll.set(0);
+            }
             KeyCode::Char('c') if ctrl => self.running = false,
             KeyCode::Char('q') | KeyCode::Esc => self.running = false,
             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
@@ -1290,26 +1289,6 @@ mod tests {
     }
 
     #[test]
-    fn issues_cover_common_violations() {
-        let raw = "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=60\r\nST: urn:x:device:A:1\r\n\
-                   USN: uuid:z::urn:x:device:B:1\r\nLOCATION: http://10.0.0.9/d.xml\r\n\
-                   SERVER: foo\r\n\r\n";
-        let m = ssdp::parse(raw.as_bytes()).unwrap();
-        let issues = advert_issues(&m, &"10.0.0.2:1900".parse().unwrap());
-        let has = |s: &str| issues.iter().any(|i| i.contains(s));
-        assert!(has("missing EXT"), "{issues:?}");
-        assert!(has("max-age=60"));
-        assert!(has("USN suffix"));
-        assert!(has("differs from sender"));
-        assert!(has("lacks UPnP/"));
-
-        let ok = alive("q", "upnp:rootdevice", 1800).replace("ftp://", "http://");
-        let m = ssdp::parse(ok.as_bytes()).unwrap();
-        let issues = advert_issues(&m, &"10.0.0.2:1900".parse().unwrap());
-        assert!(issues.is_empty(), "{issues:?}");
-    }
-
-    #[test]
     fn rows_nest_embedded_devices() {
         let (mut app, _tx) = test_app();
         for (u, loc) in [("root", "http://h/d.xml"), ("wan", "http://h/d.xml")] {
@@ -1374,6 +1353,53 @@ mod render_tests {
             .collect();
         assert!(screen.contains("InternetGatewayDevice"), "{screen}");
         assert!(screen.contains("http://h/ctl"));
+    }
+
+    #[test]
+    fn metrics_overlay_lists_sections_and_findings() {
+        let mut app = populated_app();
+        let rows = app.metrics_rows();
+        let keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
+        for s in [
+            "Session",
+            "Traffic",
+            "Discovery",
+            "Descriptions",
+            "Searching",
+            "Control points",
+            "Links",
+            "Issues",
+        ] {
+            assert!(keys.contains(&s), "missing section {s}: {keys:?}");
+        }
+        let summary = &rows.iter().find(|(k, _)| k == "summary").unwrap().1;
+        // max-age=60 warnings on the devices, MX=9 + unquoted MAN on the
+        // control point; the garbage packet is counted, not a finding.
+        assert!(summary.contains("warnings"), "{summary}");
+        assert!(app
+            .findings()
+            .iter()
+            .any(|f| f.scope.starts_with("control point 10.0.0.7")));
+        assert_eq!(app.metrics.searches_foreign, 1);
+        assert_eq!(app.metrics.notify_alive, 3);
+        assert_eq!(app.metrics.devices_seen_total, 2);
+
+        app.handle_key(&KeyEvent::from(KeyCode::Char('m')));
+        assert!(app.show_metrics);
+        // Overlay swallows navigation keys; scrolling clamps on render.
+        app.handle_key(&KeyEvent::from(KeyCode::End));
+        let mut term = ratatui::Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| ui::draw(f, &app)).unwrap();
+        let max = rows.len().saturating_sub(app.metrics_viewport.get());
+        assert_eq!(app.metrics_scroll.get(), max);
+        app.handle_key(&KeyEvent::from(KeyCode::Esc));
+        assert!(!app.show_metrics);
+        assert!(app.running);
+        for (w, h) in [(160, 40), (40, 8), (12, 4)] {
+            app.show_metrics = true;
+            let mut term = ratatui::Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| ui::draw(f, &app)).unwrap();
+        }
     }
 }
 

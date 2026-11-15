@@ -494,6 +494,21 @@ fn join_candidate(name: &str, usable: bool, selection: Option<&HashSet<String>>)
         }
 }
 
+/// Names of the links currently joined for v4 and v6 (metrics view).
+pub fn usable_links(selection: Option<&HashSet<String>>) -> (Vec<String>, Vec<String>) {
+    let mut v4: Vec<String> = v4_interfaces(selection)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    let mut v6: Vec<String> = v6_interfaces(selection)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    v4.sort();
+    v6.sort();
+    (v4, v6)
+}
+
 fn v4_interfaces(selection: Option<&HashSet<String>>) -> Vec<(String, Ipv4Addr)> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
